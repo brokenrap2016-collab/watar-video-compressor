@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ضاغط فيديو وتار (Watar Video Compressor) - إصدار دفعات متعددة
+ضاغط فيديوهات وتر (Watar Video Compressor) - إصدار دفعات متعددة
 ------------------------------------------------------------------
 برنامج لويندوز (واجهة رسومية) يصغّر مجموعة فيديوهات دفعة واحدة
 (ملفات تختارها، أو مجلد كامل بالكامل)، باستخدام أكفأ طريقة ترميز
@@ -422,7 +422,7 @@ def run_gui():
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("Watar Production - ضاغط فيديو وتار")
+    root.title("Watar Production - ضاغط فيديوهات وتر")
     root.geometry("700x860")
     root.resizable(False, True)
 
