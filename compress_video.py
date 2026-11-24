@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 
 AUDIO_KBPS_DEFAULT = 128
@@ -414,6 +415,87 @@ def estimate_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
 
 
 # ---------------------------------------------------------------------------
+# معاينة بصرية للجودة: صورة حقيقية (فريم واحد) قبل/بعد الضغط، بدون انتظار
+# ضغط الفيديو كامل. تُستخدم على عيّنة قصيرة فقط (مثل التقدير السريع أعلاه)
+# لكن بدل رقم SSIM وحده، تعرض الفريم فعلياً بالعين.
+# ---------------------------------------------------------------------------
+
+def extract_frame_png(path, timestamp_seconds, out_path, log, width=640):
+    """يسحب فريم واحد من الفيديو عند ثانية معيّنة ويحفظه كصورة PNG."""
+    cmd = [FFMPEG, "-y", "-ss", f"{timestamp_seconds:.2f}", "-i", path,
+           "-frames:v", "1", "-vf", f"scale={width}:-2", out_path]
+    run_checked(cmd, log)
+
+
+def preview_quality(path, mode, encoder_key, log, target_mb=None, quality_level=None,
+                     manual_value=None, denoise_level="off", audio_kbps=AUDIO_KBPS_DEFAULT,
+                     sample_len=3.0, frame_width=640):
+    """
+    معاينة سريعة لجودة الضغط على فيديو واحد: يسحب عيّنة قصيرة من منتصف الفيديو
+    تقريباً، يضغطها بنفس الإعدادات المطلوبة، ثم يطلع صورتين (قبل/بعد) لنفس
+    اللحظة بالضبط حتى تتم المقارنة بالعين مباشرة، بالإضافة لتقدير الحجم
+    النهائي ودرجة SSIM المحسوبة على نفس العيّنة.
+
+    يرجع dict: before_png, after_png, estimated_mb, ssim, verdict, tmp_dir
+    (المجلد المؤقت الذي يحوي الصورتين - على المستدعي حذفه بعد عرضهما).
+    """
+    duration = get_duration_seconds(path)
+    if duration <= 0:
+        raise RuntimeError("تعذر قراءة مدة الفيديو")
+
+    eff_sample_len = min(sample_len, duration) if duration < sample_len else sample_len
+    start = max(0.0, min(duration * 0.4, max(0.0, duration - eff_sample_len)))
+    vf = DENOISE_FILTERS.get(denoise_level)
+
+    tmp_dir = tempfile.mkdtemp(prefix="watar_preview_")
+    raw = os.path.join(tmp_dir, "raw.mp4")
+    enc = os.path.join(tmp_dir, "enc.mp4")
+    before_png = os.path.join(tmp_dir, "before.png")
+    after_png = os.path.join(tmp_dir, "after.png")
+
+    try:
+        extract_sample(path, start, eff_sample_len, raw, log)
+        actual_dur = get_duration_seconds(raw)
+        if actual_dur <= 0:
+            raise RuntimeError("تعذّر سحب عيّنة من هذا الفيديو للمعاينة")
+
+        if mode == "size":
+            target_video_kbps = max(compute_video_kbps(target_mb, duration, audio_kbps), 150)
+            if encoder_key in ("av1_nvenc", "hevc_nvenc"):
+                cmd = build_nvenc_bitrate_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+            else:
+                cmd = build_x26x_singlepass_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+        else:
+            quality_value = manual_value if manual_value is not None else QUALITY_PRESETS[encoder_key][quality_level]
+            cmd = build_quality_cmd(raw, enc, encoder_key, quality_value, audio_kbps, vf)
+        run_checked(cmd, log)
+
+        frame_t = max(0.0, min(actual_dur / 2.0, actual_dur - 0.05))
+        extract_frame_png(raw, frame_t, before_png, log, frame_width)
+        extract_frame_png(enc, frame_t, after_png, log, frame_width)
+
+        enc_size = os.path.getsize(enc)
+        sample_kbps = (enc_size * 8 / 1000) / actual_dur
+        estimated_mb = sample_kbps * duration / 8000
+        ssim = measure_ssim(raw, enc, log)
+
+        return {
+            "before_png": before_png, "after_png": after_png,
+            "estimated_mb": estimated_mb, "ssim": ssim,
+            "verdict": ssim_to_verdict(ssim), "tmp_dir": tmp_dir,
+        }
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        for f in (raw, enc):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # واجهة المستخدم الرسومية (tkinter - مدمجة مع بايثون، لا تحتاج تثبيت إضافي)
 # ---------------------------------------------------------------------------
 
@@ -507,6 +589,19 @@ def run_gui():
     tk.Button(btn_row, text="أضف مجلد كامل...", command=add_folder).pack(side="left", padx=4)
     tk.Button(btn_row, text="إزالة المحدد", command=remove_selected).pack(side="left", padx=4)
     tk.Button(btn_row, text="تفريغ القائمة", command=clear_all).pack(side="left", padx=4)
+
+    # --- معاينة سريعة (صورة قبل/بعد) ---------------------------------------
+    preview_frame = tk.Frame(root); preview_frame.pack(fill="x", padx=12, pady=(2, 6))
+    tk.Label(preview_frame,
+             text="معاينة سريعة: اختر فيديو من القائمة فوق (أو اتركه فاضي ليأخذ أول فيديو بالقائمة)،\n"
+                  "اكتب الحجم الذي تريد أن يخرج به الفيديو، وشوف صورة فريم حقيقي قبل وبعد الضغط:",
+             anchor="w", justify="right").pack(anchor="w")
+    preview_row = tk.Frame(preview_frame); preview_row.pack(anchor="w", pady=4)
+    preview_size_var = tk.StringVar(value="4000")
+    tk.Label(preview_row, text="الحجم المطلوب (ميجابايت):").pack(side="left")
+    tk.Entry(preview_row, textvariable=preview_size_var, width=10).pack(side="left", padx=6)
+    preview_btn = tk.Button(preview_row, text="معاينة الجودة (صورة قبل/بعد)", command=lambda: run_preview())
+    preview_btn.pack(side="left", padx=10)
 
     # --- الطريقة -----------------------------------------------------------
     tk.Label(root, text="٢) الطريقة:", anchor="w").pack(fill="x", **pad)
@@ -622,6 +717,83 @@ def run_gui():
             "key": key, "mode": mode, "level": level, "manual_value": manual_value,
             "target_mb": target_mb, "denoise_level": denoise_level,
         }
+
+    def show_preview_window(path, res):
+        win = tk.Toplevel(root)
+        win.title("معاينة الجودة - " + os.path.basename(path))
+        try:
+            before_img = tk.PhotoImage(file=res["before_png"])
+            after_img = tk.PhotoImage(file=res["after_png"])
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذر عرض صور المعاينة: {e}")
+            win.destroy()
+            return
+        finally:
+            shutil.rmtree(res.get("tmp_dir", ""), ignore_errors=True)
+
+        logo_refs.extend([before_img, after_img])  # منع حذف الصور من الذاكرة
+
+        imgs_row = tk.Frame(win); imgs_row.pack(padx=10, pady=10)
+        before_col = tk.Frame(imgs_row); before_col.pack(side="right", padx=6)
+        tk.Label(before_col, text="قبل الضغط (الأصل)").pack()
+        tk.Label(before_col, image=before_img).pack()
+        after_col = tk.Frame(imgs_row); after_col.pack(side="right", padx=6)
+        tk.Label(after_col, text="بعد الضغط (نفس اللحظة بالضبط)").pack()
+        tk.Label(after_col, image=after_img).pack()
+
+        ssim_txt = f"{res['ssim']:.3f}" if res.get("ssim") is not None else "—"
+        try:
+            before_mb = os.path.getsize(path) / (1024 * 1024)
+        except OSError:
+            before_mb = 0
+        info = (f"الحجم الحالي: {before_mb:.0f} MB   →   الحجم المتوقع الكلي للفيديو كامل: "
+                f"~{res['estimated_mb']:.0f} MB\n"
+                f"الجودة المتوقعة: {res['verdict']}   (SSIM: {ssim_txt})\n"
+                "ملاحظة: هذه معاينة على عيّنة قصيرة فقط، فالنتيجة النهائية الحقيقية قد تختلف شوي.")
+        tk.Label(win, text=info, justify="right", padx=10, pady=6).pack()
+        tk.Button(win, text="إغلاق", command=win.destroy).pack(pady=8)
+
+    def run_preview():
+        sel = files_listbox.curselection()
+        if sel:
+            path = files[sel[0]]
+        elif files:
+            path = files[0]
+        else:
+            messagebox.showwarning("تنبيه", "أضف فيديو واحد على الأقل أولاً.")
+            return
+
+        try:
+            target_mb = float(preview_size_var.get())
+            if target_mb <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("تنبيه", "اكتب حجماً مستهدفاً صحيحاً بالميجابايت للمعاينة.")
+            return
+
+        key = label_to_key.get(encoder_choice.get())
+        if not key:
+            messagebox.showwarning("تنبيه", "اختر طريقة ترميز من القسم (٣) أولاً.")
+            return
+        denoise_label_to_key = {v: k for k, v in DENOISE_LEVEL_LABELS.items()}
+        denoise_level = denoise_label_to_key.get(denoise_var.get(), "off")
+
+        preview_btn["state"] = "disabled"
+        status.set("جاري تجهيز المعاينة...")
+
+        def worker():
+            try:
+                res = preview_quality(path, "size", key, log, target_mb=target_mb,
+                                       denoise_level=denoise_level)
+                root.after(0, lambda: show_preview_window(path, res))
+            except Exception as e:
+                err = str(e)
+                root.after(0, lambda: messagebox.showerror("خطأ", f"تعذرت المعاينة: {err}"))
+            finally:
+                status.set("جاهز")
+                preview_btn["state"] = "normal"
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def estimate():
         settings = gather_settings()
