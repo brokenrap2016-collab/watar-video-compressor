@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 AUDIO_KBPS_DEFAULT = 320  # جودة صوت عالية (320kbps) - ما تنزل الجودة حتى لو صغّرنا الفيديو كثير
 SAFETY_MARGIN = 0.97  # لطريقة "حجم محدد": نهدف لحجم أقل بقليل من المستهدف كهامش أمان
@@ -164,6 +165,131 @@ def scan_folder_for_videos(folder):
     return sorted(found)
 
 
+def format_eta(seconds):
+    """يحوّل عدد الثواني لنص عربي مفهوم (مثلاً 'ساعة و12 دقيقة')."""
+    seconds = int(max(seconds, 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} ساعة و{m} دقيقة"
+    if m:
+        return f"{m} دقيقة"
+    return f"{s} ثانية"
+
+
+def settings_file_path():
+    """مسار ملف حفظ آخر إعدادات مستخدمة - بجانب البرنامج نفسه (exe أو سكربت)."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base = os.getcwd()
+    return os.path.join(base, "watar_compressor_settings.json")
+
+
+def load_saved_settings():
+    try:
+        with open(settings_file_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings_to_disk(data):
+    try:
+        with open(settings_file_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # حفظ الإعدادات ميزة إضافية - ما بدنا نوقف البرنامج لو فشل لأي سبب
+
+
+def default_output_path(path, output_dir=None):
+    """نفس منطق تسمية ملف الناتج المستخدم بـcompress_one، بدون تنفيذ أي ضغط.
+    يُستخدم لمعرفة هل فيديو معيّن له ناتج مضغوط موجود مسبقاً أصلاً."""
+    base_name = os.path.splitext(os.path.basename(path))[0] + "_compressed.mp4"
+    if output_dir:
+        return os.path.join(output_dir, base_name)
+    return os.path.splitext(path)[0] + "_compressed.mp4"
+
+
+def has_compressed_output(path, output_dir=None):
+    """هل عندنا أصلاً ناتج مضغوط لهذا الفيديو (بنفس مكان الحفظ الحالي)؟
+    يُستخدم لتخطّي الفيديوهات المضغوطة مسبقاً تلقائياً."""
+    return os.path.isfile(default_output_path(path, output_dir))
+
+
+# ---------------------------------------------------------------------------
+# معلومات مسارات الفيديو (صوت/ترجمة متعددة) - لحفظها كلها عند الضغط بدل ما
+# يكتفي ffmpeg بالمسار الأول فقط بشكل افتراضي
+# ---------------------------------------------------------------------------
+
+TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+
+def probe_stream_info(path):
+    """يرجع قائمة بمعلومات كل مسار (ستريم) بالملف: index, codec_type, codec_name, bit_rate."""
+    cmd = [FFPROBE, "-v", "error", "-show_entries",
+           "stream=index,codec_type,codec_name,bit_rate", "-of", "json", path]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return json.loads(out.stdout).get("streams", [])
+
+
+def build_map_args(path, log=None):
+    """
+    يبني معاملات -map لحفظ كل مسارات الفيديو والصوت (مش بس الأول)، بالإضافة
+    لمسارات الترجمة النصية فقط (المتوافقة مع حاوية mp4 عبر mov_text). ترجمة
+    بصيغة صور (مثل PGS من أقراص Blu-ray) غير مدعومة بصيغة mp4 فنستبعدها مع
+    تنبيه بالسجل بدل ما يفشل الضغط كامل.
+    يرجع: (map_args: list, subtitle_codec_args: list)
+    """
+    try:
+        streams = probe_stream_info(path)
+    except Exception:
+        return ["-map", "0:v:0?", "-map", "0:a?"], []
+
+    map_args = ["-map", "0:v:0?", "-map", "0:a?"]
+    sub_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    text_sub_indices = [s["index"] for s in sub_streams if s.get("codec_name") in TEXT_SUBTITLE_CODECS]
+    other_subs_count = len(sub_streams) - len(text_sub_indices)
+
+    if other_subs_count and log:
+        log(f"  ملاحظة: هذا الفيديو فيه {other_subs_count} مسار ترجمة بصيغة صور (مش نصية)، "
+            f"غير مدعومة بصيغة mp4 الناتجة - رح تُستبعد من الملف المضغوط.")
+
+    sub_args = []
+    for idx in text_sub_indices:
+        map_args += ["-map", f"0:{idx}"]
+    if text_sub_indices:
+        sub_args = ["-c:s", "mov_text"]
+
+    return map_args, sub_args
+
+
+def probe_total_audio_kbps(path, fallback=AUDIO_KBPS_DEFAULT):
+    """يحسب مجموع بترات كل مسارات الصوت الأصلية - لتقدير أدق لميزانية بترات
+    الفيديو بوضع 'حجم مستهدف' عند اختيار نسخ الصوت الأصلي بدون إعادة ترميز.
+    لو تعذر قراءة البترات، نرجع القيمة الاحتياطية (تقدير آمن)."""
+    try:
+        streams = probe_stream_info(path)
+    except Exception:
+        return fallback
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        return 0
+    total = 0.0
+    for s in audio_streams:
+        br = s.get("bit_rate")
+        if br is None:
+            return fallback
+        try:
+            total += int(br) / 1000.0
+        except (TypeError, ValueError):
+            return fallback
+    return total
+
+
 # ---------------------------------------------------------------------------
 # طريقة "حجم ملف محدد" (بتريت مُحسوب + ترميز بمرحلتين للمرمّزات البرمجية)
 # ---------------------------------------------------------------------------
@@ -188,44 +314,63 @@ def _vf_args(vf):
     return ["-vf", vf] if vf else []
 
 
-def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None):
+def audio_args(audio_kbps, copy_audio=False):
+    """-c:a copy (بدون أي إعادة ترميز، صفر فقدان) أو AAC بالبترات المطلوبة."""
+    if copy_audio:
+        return ["-c:a", "copy"]
+    return ["-c:a", "aac", "-b:a", f"{audio_kbps}k"]
+
+
+def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None,
+                             map_args=None, sub_args=None, copy_audio=False):
     v_bitrate = f"{int(video_kbps)}k"
     maxrate = f"{int(video_kbps * 1.5)}k"
     bufsize = f"{int(video_kbps * 2)}k"
     return [
         FFMPEG, "-y", "-i", path,
+        *(map_args or []),
         "-c:v", codec, "-preset", "p7", "-rc", "vbr",
         "-b:v", v_bitrate, "-maxrate", maxrate, "-bufsize", bufsize,
         *_vf_args(vf),
-        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        *audio_args(audio_kbps, copy_audio),
+        *(sub_args or []),
         out_path,
     ]
 
 
-def build_x26x_2pass_cmds(path, out_path, codec, video_kbps, audio_kbps, vf=None):
+def build_x26x_2pass_cmds(path, out_path, codec, video_kbps, audio_kbps, vf=None,
+                           map_args=None, sub_args=None, copy_audio=False):
     # preset "slow": نفس مستوى الجودة المستخدم بوضع "جودة عالية تلقائياً"، حتى
     # نستخرج أعلى جودة ممكنة من نفس عدد البتات المستهدف، بدل الإعداد الافتراضي
     # "medium" (أسرع لكن أضعف كفاءة ضغط بنفس البتريت).
+    # الممرة الأولى (pass 1) تحليل بترات فقط، فيديو بدون صوت/ترجمة، والناتج يُرمى.
     v_bitrate = f"{int(video_kbps)}k"
     null_out = null_output()
+    pass1_map = ["-map", "0:v:0?"]
     if codec == "libx265":
-        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-x265-params", "pass=1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
-                 *_vf_args(vf), "-x265-params", "pass=2", "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path]
+        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx265", "-preset", "slow",
+                 "-b:v", v_bitrate, *_vf_args(vf), "-x265-params", "pass=2",
+                 *audio_args(audio_kbps, copy_audio), *(sub_args or []), out_path]
     else:  # libx264
-        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-pass", "1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
-                 *_vf_args(vf), "-pass", "2", "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path]
+        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx264", "-preset", "slow",
+                 "-b:v", v_bitrate, *_vf_args(vf), "-pass", "2",
+                 *audio_args(audio_kbps, copy_audio), *(sub_args or []), out_path]
     return pass1, pass2
 
 
 def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps=AUDIO_KBPS_DEFAULT,
-                          denoise_level="off"):
+                          denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None):
     duration = get_duration_seconds(path)
     four_k = is_4k_or_above(path)
-    video_kbps = compute_video_kbps(target_mb, duration, audio_kbps)
+
+    # لو رح ننسخ الصوت الأصلي بدون إعادة ترميز، نحسب بترات الصوت الفعلية
+    # (مش الافتراضية) عشان ميزانية بترات الفيديو تطلع أدق لتحقيق الحجم المطلوب.
+    effective_audio_kbps = probe_total_audio_kbps(path, fallback=audio_kbps) if copy_audio else audio_kbps
+    video_kbps = compute_video_kbps(target_mb, duration, effective_audio_kbps)
 
     floor = quality_floor_kbps(four_k)
     if video_kbps < floor:
@@ -234,15 +379,30 @@ def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps
             f"ستظهر عيوب ضغط واضحة عند هذا الحجم المستهدف.")
     video_kbps = max(video_kbps, 150)
     vf = DENOISE_FILTERS.get(denoise_level)
+    map_args, sub_args = build_map_args(path, log)
 
     if encoder_key in ("av1_nvenc", "hevc_nvenc"):
         log(f"  الترميز بواسطة {encoder_key} (كرت الشاشة) لحجم مستهدف...")
-        run_checked(build_nvenc_bitrate_cmd(path, out_path, encoder_key, video_kbps, audio_kbps, vf), log)
+        cmd = build_nvenc_bitrate_cmd(path, out_path, encoder_key, video_kbps, audio_kbps, vf,
+                                       map_args, sub_args, copy_audio)
+        run_checked(cmd, log, progress_cb=progress_cb, total_duration=duration, cancel_event=cancel_event)
     elif encoder_key in ("libx265", "libx264"):
         log(f"  الترميز بالمعالج ({encoder_key}، مرحلتين) لحجم مستهدف...")
-        pass1, pass2 = build_x26x_2pass_cmds(path, out_path, encoder_key, video_kbps, audio_kbps, vf)
-        run_checked(pass1, log)
-        run_checked(pass2, log)
+        pass1, pass2 = build_x26x_2pass_cmds(path, out_path, encoder_key, video_kbps, audio_kbps, vf,
+                                              map_args, sub_args, copy_audio)
+
+        def pass1_cb(frac, _cb=progress_cb):
+            if _cb:
+                _cb(frac * 0.5)
+
+        def pass2_cb(frac, _cb=progress_cb):
+            if _cb:
+                _cb(0.5 + frac * 0.5)
+
+        run_checked(pass1, log, progress_cb=pass1_cb if progress_cb else None,
+                    total_duration=duration, cancel_event=cancel_event)
+        run_checked(pass2, log, progress_cb=pass2_cb if progress_cb else None,
+                    total_duration=duration, cancel_event=cancel_event)
     else:
         raise ValueError(f"ترميز غير معروف: {encoder_key}")
 
@@ -251,42 +411,107 @@ def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps
 # طريقة "جودة عالية تلقائياً" (CRF/CQ - موصى بها)
 # ---------------------------------------------------------------------------
 
-def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf=None):
+def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf=None,
+                       map_args=None, sub_args=None, copy_audio=False):
     if encoder_key in ("libx265", "libx264"):
         return [
             FFMPEG, "-y", "-i", path,
+            *(map_args or []),
             "-c:v", encoder_key, "-preset", "slow", "-crf", str(quality_value),
             *_vf_args(vf),
-            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            *audio_args(audio_kbps, copy_audio),
+            *(sub_args or []),
             out_path,
         ]
     elif encoder_key in ("hevc_nvenc", "av1_nvenc"):
         return [
             FFMPEG, "-y", "-i", path,
+            *(map_args or []),
             "-c:v", encoder_key, "-preset", "p7", "-rc", "vbr",
             "-cq", str(quality_value), "-b:v", "0",
             *_vf_args(vf),
-            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            *audio_args(audio_kbps, copy_audio),
+            *(sub_args or []),
             out_path,
         ]
     raise ValueError(f"ترميز غير معروف: {encoder_key}")
 
 
 def compress_quality(path, out_path, encoder_key, level, manual_value, log, audio_kbps=AUDIO_KBPS_DEFAULT,
-                      denoise_level="off"):
+                      denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None):
     value = manual_value if manual_value is not None else QUALITY_PRESETS[encoder_key][level]
     vf = DENOISE_FILTERS.get(denoise_level)
+    map_args, sub_args = build_map_args(path, log)
     log(f"  الترميز بواسطة {encoder_key} بجودة ثابتة (قيمة {value})"
         f"{' مع تنعيم ضوضاء' if vf else ''}...")
-    run_checked(build_quality_cmd(path, out_path, encoder_key, value, audio_kbps, vf), log)
+    cmd = build_quality_cmd(path, out_path, encoder_key, value, audio_kbps, vf, map_args, sub_args, copy_audio)
+    duration = get_duration_seconds(path) if progress_cb else None
+    run_checked(cmd, log, progress_cb=progress_cb, total_duration=duration, cancel_event=cancel_event)
 
 
-def run_checked(cmd, log):
+class CompressionCancelled(Exception):
+    """تُرفع لما المستخدم يضغط إلغاء وهو الضغط شغال."""
+    pass
+
+
+def run_checked(cmd, log, progress_cb=None, total_duration=None, cancel_event=None):
+    """ينفذ أمر ffmpeg. لو تم تمرير progress_cb ومدة إجمالية صحيحة، ينفذ الأمر
+    بشكل متدفق (Popen) ويقرأ تقدّم ffmpeg الحقيقي (-progress) مباشرة أولاً
+    بأول، ويستدعي progress_cb(نسبة من 0 إلى 1) بشكل مستمر، مع إمكانية الإلغاء
+    الفوري عبر cancel_event. بدون هذول، ينفذ الأمر بالطريقة البسيطة كالسابق."""
     log("  > " + " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if not (progress_cb and total_duration):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd,
+                                                 output=proc.stdout, stderr=proc.stderr)
+        return
+
+    full_cmd = cmd + ["-progress", "pipe:1", "-nostats"]
+    proc = subprocess.Popen(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, bufsize=1)
+    stderr_text = []
+
+    def read_stderr():
+        try:
+            for line in proc.stderr:
+                stderr_text.append(line)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=read_stderr, daemon=True)
+    t.start()
+
+    cancelled = False
+    try:
+        for line in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                proc.terminate()
+                break
+            line = line.strip()
+            if line.startswith("out_time="):
+                val = line.split("=", 1)[1].strip()
+                try:
+                    h, m, s = val.split(":")
+                    secs = int(h) * 3600 + int(m) * 60 + float(s)
+                    progress_cb(min(max(secs / total_duration, 0.0), 1.0))
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("progress=") and line.split("=", 1)[1].strip() == "end":
+                progress_cb(1.0)
+    finally:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        t.join(timeout=2)
+
+    if cancelled:
+        raise CompressionCancelled("تم إلغاء الضغط بواسطة المستخدم")
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd,
-                                             output=proc.stdout, stderr=proc.stderr)
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output="", stderr="".join(stderr_text))
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +530,8 @@ def run_checked(cmd, log):
 
 def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, log,
                                quality_level="balanced", manual_value=None,
-                               audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off"):
+                               audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
+                               copy_audio=False, progress_cb=None, cancel_event=None):
     before_mb = os.path.getsize(path) / (1024 * 1024)
     duration = get_duration_seconds(path)
 
@@ -323,7 +549,8 @@ def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, lo
             f">= {percent_reduction:.0f}% المطلوب) - سيُستخدم وضع الجودة مباشرة بدون أي "
             f"تضييق إضافي على الحجم.")
         compress_quality(path, out_path, encoder_key, quality_level, manual_value, log,
-                          audio_kbps, denoise_level)
+                          audio_kbps, denoise_level, copy_audio=copy_audio,
+                          progress_cb=progress_cb, cancel_event=cancel_event)
         return
 
     if predicted_pct is not None:
@@ -347,7 +574,8 @@ def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, lo
             f"(~{achieved_pct:.0f}% تقريباً) بدل الوصول للنسبة المطلوبة كاملة.")
         target_mb = safe_target_mb
 
-    compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level)
+    compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level,
+                          copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event)
 
 
 def unique_output_path(out_path):
@@ -364,7 +592,8 @@ def unique_output_path(out_path):
 
 def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=None,
                   manual_value=None, audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
-                  output_dir=None, smart_percent=None):
+                  output_dir=None, smart_percent=None, copy_audio=False,
+                  progress_cb=None, cancel_event=None):
     """ينفذ الضغط لملف واحد حسب الطريقة المختارة، ويرجع مسار الملف الناتج.
     لو output_dir محدد يُحفظ الناتج هناك، وإلا بجانب الفيديو الأصلي (كالسابق)."""
     if output_dir:
@@ -374,13 +603,17 @@ def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
         out_path = os.path.splitext(path)[0] + "_compressed.mp4"
     if mode == "quality":
         compress_quality(path, out_path, encoder_key, quality_level, manual_value, log, audio_kbps,
-                          denoise_level)
+                          denoise_level, copy_audio=copy_audio, progress_cb=progress_cb,
+                          cancel_event=cancel_event)
     elif mode == "size":
-        compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level)
+        compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level,
+                              copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event)
     elif mode == "smart_percent":
         compress_smart_percentage(path, out_path, smart_percent, encoder_key, log,
                                    quality_level=quality_level, manual_value=manual_value,
-                                   audio_kbps=audio_kbps, denoise_level=denoise_level)
+                                   audio_kbps=audio_kbps, denoise_level=denoise_level,
+                                   copy_audio=copy_audio, progress_cb=progress_cb,
+                                   cancel_event=cancel_event)
     else:
         raise ValueError(f"طريقة غير معروفة: {mode}")
     return out_path
@@ -591,9 +824,21 @@ def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    root = tk.Tk()
+    # دعم السحب والإفلات (drag & drop) اختياري عبر مكتبة tkinterdnd2 - لو مش
+    # متوفرة (أو صار أي خطأ بتحميلها)، البرنامج يشتغل عادي تماماً بدونها،
+    # ويضل زر "أضف ملفات..." هو الطريقة الأساسية المضمونة دايماً.
+    dnd_root_cls = tk.Tk
+    dnd_files_const = None
+    try:
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+        dnd_root_cls = TkinterDnD.Tk
+        dnd_files_const = DND_FILES
+    except Exception:
+        pass
+
+    root = dnd_root_cls()
     root.title("Watar Production - ضاغط فيديوهات وتر")
-    root.geometry("700x860")
+    root.geometry("700x900")
     root.resizable(False, True)
 
     # --- الشعار (مضمّن بالملف نفسه - بدون أي صورة خارجية) --------------------
@@ -621,7 +866,12 @@ def run_gui():
     target_mb_var = tk.StringVar(value="4000")
     encoder_choice = tk.StringVar()
     denoise_var = tk.StringVar(value=DENOISE_LEVEL_LABELS["off"])
+    copy_audio_var = tk.BooleanVar(value=False)
+    delete_originals_var = tk.BooleanVar(value=False)
     status = tk.StringVar(value="جاهز")
+    progress_var = tk.DoubleVar(value=0.0)
+    eta_var = tk.StringVar(value="")
+    cancel_event = threading.Event()
 
     pad = {"padx": 12, "pady": 6}
 
@@ -644,14 +894,36 @@ def run_gui():
             except OSError:
                 files_listbox.insert("end", os.path.basename(p))
 
+    def current_output_dir_for_skip_check():
+        return output_dir_var.get().strip() if output_mode_var.get() == "custom" else None
+
+    def add_paths(paths):
+        """يضيف قائمة مسارات (ملفات أو مجلدات) للدفعة، مع تخطّي أي فيديو له
+        ناتج مضغوط موجود مسبقاً بمكان الحفظ الحالي. يرجع (عدد المُضاف, عدد المتخطّى)."""
+        out_dir = current_output_dir_for_skip_check()
+        added, skipped = 0, 0
+        for p in paths:
+            if p in files:
+                continue
+            if has_compressed_output(p, out_dir):
+                skipped += 1
+                continue
+            files.append(p)
+            added += 1
+        refresh_listbox()
+        return added, skipped
+
     def add_files():
         paths = filedialog.askopenfilenames(
             filetypes=[("فيديو", "*.mp4 *.mkv *.mov *.avi *.ts *.m4v *.wmv *.flv *.webm"),
                        ("كل الملفات", "*.*")])
-        for p in paths:
-            if p not in files:
-                files.append(p)
-        refresh_listbox()
+        if not paths:
+            return
+        added, skipped = add_paths(paths)
+        if skipped:
+            messagebox.showinfo("تخطّي ملفات مضغوطة مسبقاً",
+                                 f"تمت إضافة {added} فيديو، وتخطّي {skipped} فيديو له ناتج "
+                                 f"مضغوط موجود مسبقاً تلقائياً.")
 
     def add_folder():
         folder = filedialog.askdirectory()
@@ -661,10 +933,11 @@ def run_gui():
         if not found:
             messagebox.showinfo("لا يوجد", "لم يتم العثور على فيديوهات داخل هذا المجلد.")
             return
-        for p in found:
-            if p not in files:
-                files.append(p)
-        refresh_listbox()
+        added, skipped = add_paths(found)
+        msg = f"تمت إضافة {added} فيديو."
+        if skipped:
+            msg += f"\nتم تخطّي {skipped} فيديو له ناتج مضغوط موجود مسبقاً تلقائياً."
+        messagebox.showinfo("تمت الإضافة", msg)
 
     def remove_selected():
         sel = list(files_listbox.curselection())
@@ -681,6 +954,32 @@ def run_gui():
     tk.Button(btn_row, text="أضف مجلد كامل...", command=add_folder).pack(side="left", padx=4)
     tk.Button(btn_row, text="إزالة المحدد", command=remove_selected).pack(side="left", padx=4)
     tk.Button(btn_row, text="تفريغ القائمة", command=clear_all).pack(side="left", padx=4)
+
+    # --- سحب وإفلات (اختياري، لو مكتبة tkinterdnd2 متوفرة) --------------------
+    if dnd_files_const is not None:
+        def handle_drop(event):
+            try:
+                dropped = root.tk.splitlist(event.data)
+            except Exception:
+                dropped = [event.data]
+            collected = []
+            for p in dropped:
+                if os.path.isdir(p):
+                    collected.extend(scan_folder_for_videos(p))
+                elif os.path.isfile(p) and os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS:
+                    collected.append(p)
+            if collected:
+                add_paths(collected)
+
+        try:
+            files_listbox.drop_target_register(dnd_files_const)
+            files_listbox.dnd_bind("<<Drop>>", handle_drop)
+            root.drop_target_register(dnd_files_const)
+            root.dnd_bind("<<Drop>>", handle_drop)
+            tk.Label(root, text="(تقدر كمان تسحب وتفلت ملفات أو مجلدات فيديو مباشرة على هذه النافذة)",
+                     fg="#777", anchor="w").pack(fill="x", padx=12)
+        except Exception:
+            pass
 
     # --- معاينة سريعة (صورة قبل/بعد) ---------------------------------------
     preview_frame = tk.Frame(root); preview_frame.pack(fill="x", padx=12, pady=(2, 6))
@@ -756,6 +1055,11 @@ def run_gui():
                                  values=list(DENOISE_LEVEL_LABELS.values()))
     denoise_menu.pack(anchor="w", padx=12)
 
+    tk.Checkbutton(root, text="انسخ الصوت الأصلي بدون إعادة ترميز (أسرع وبدون أي فقدان بالصوت إطلاقاً - "
+                               "لا يعمل مع وضع 'حجم ملف محدد' بدقة كاملة لأن حجم الصوت يبقى كما هو)",
+                   variable=copy_audio_var, anchor="w", justify="right",
+                   wraplength=660).pack(fill="x", padx=12, pady=(2, 0))
+
     # --- مكان الحفظ ----------------------------------------------------------
     tk.Label(root, text="٥) مكان حفظ الفيديوهات بعد الضغط:", anchor="w").pack(fill="x", **pad)
     output_mode_var = tk.StringVar(value="same")
@@ -784,6 +1088,9 @@ def run_gui():
             output_dir_frame.pack(fill="x", padx=12, pady=2)
         else:
             output_dir_frame.pack_forget()
+
+    tk.Checkbutton(root, text="⚠ احذف الفيديو الأصلي تلقائياً بعد نجاح الضغط (لا يمكن التراجع عن الحذف!)",
+                   variable=delete_originals_var, fg="#b00020", anchor="w").pack(fill="x", padx=12, pady=(4, 0))
 
     # --- السجل والحالة -------------------------------------------------------
     log_box = tk.Text(root, height=13, width=84, state="disabled")
@@ -872,7 +1179,8 @@ def run_gui():
         return {
             "key": key, "mode": mode, "level": level, "manual_value": manual_value,
             "target_mb": target_mb, "denoise_level": denoise_level, "output_dir": output_dir,
-            "smart_percent": smart_percent,
+            "smart_percent": smart_percent, "copy_audio": copy_audio_var.get(),
+            "delete_originals": delete_originals_var.get(),
         }
 
     def show_preview_window(path, res):
@@ -1003,6 +1311,11 @@ def run_gui():
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def request_cancel():
+        cancel_event.set()
+        status.set("جاري الإلغاء... (رح يتوقف بعد انتهاء الخطوة الحالية)")
+        stop_btn["state"] = "disabled"
+
     def start():
         settings = gather_settings()
         if not settings:
@@ -1015,6 +1328,8 @@ def run_gui():
         denoise_level = settings["denoise_level"]
         output_dir = settings["output_dir"]
         smart_percent = settings["smart_percent"]
+        copy_audio = settings["copy_audio"]
+        delete_originals = settings["delete_originals"]
 
         if output_dir:
             try:
@@ -1023,38 +1338,105 @@ def run_gui():
                 messagebox.showerror("خطأ", f"تعذر استخدام مجلد الحفظ هذا: {e}")
                 return
 
+        if delete_originals:
+            confirmed = messagebox.askyesno(
+                "تأكيد الحذف التلقائي",
+                "فعّلت خيار حذف الفيديوهات الأصلية تلقائياً بعد نجاح الضغط.\n"
+                "هذا الإجراء نهائي ولا يمكن التراجع عنه بعد الحذف.\n\n"
+                "متأكد تريد المتابعة؟")
+            if not confirmed:
+                return
+
+        cancel_event.clear()
         estimate_btn["state"] = "disabled"
         start_btn["state"] = "disabled"
+        stop_btn["state"] = "normal"
+        progress_var.set(0)
+        eta_var.set("")
         batch = list(files)
+
+        # مدة كل فيديو (لحساب تقدير الوقت المتبقي للدفعة كاملة)
+        durations = {}
+        for p in batch:
+            try:
+                durations[p] = get_duration_seconds(p)
+            except Exception:
+                durations[p] = 0.0
+        total_duration_all = sum(durations.values())
 
         def worker():
             total_before = 0
             total_after = 0
             ok_count = 0
+            cancelled_flag = False
+            batch_start_time = time.time()
+            duration_done = 0.0
+
             for idx, path in enumerate(batch, 1):
+                if cancel_event.is_set():
+                    cancelled_flag = True
+                    break
                 name = os.path.basename(path)
-                status.set(f"({idx}/{len(batch)}) {name}")
+                file_duration = durations.get(path, 0.0)
+                base_done = duration_done
+
+                def file_progress_cb(frac, _idx=idx, _name=name, _fd=file_duration, _base=base_done):
+                    progress_var.set(frac * 100)
+                    done_equiv = _base + frac * _fd
+                    elapsed = time.time() - batch_start_time
+                    eta_txt = ""
+                    if done_equiv > 2 and total_duration_all > 0:
+                        speed = elapsed / done_equiv
+                        remaining = max(total_duration_all - done_equiv, 0) * speed
+                        eta_txt = f"  |  الوقت المتبقي التقريبي للدفعة: {format_eta(remaining)}"
+                        eta_var.set(eta_txt.strip(" |"))
+                    status.set(f"({_idx}/{len(batch)}) {_name} - {frac * 100:.0f}%{eta_txt}")
+
                 log(f"[{idx}/{len(batch)}] {name}")
                 try:
                     before_mb = os.path.getsize(path) / (1024 * 1024)
                     out_path = compress_one(path, mode, key, log, target_mb=target_mb,
                                              quality_level=level, manual_value=manual_value,
                                              denoise_level=denoise_level, output_dir=output_dir,
-                                             smart_percent=smart_percent)
+                                             smart_percent=smart_percent, copy_audio=copy_audio,
+                                             progress_cb=file_progress_cb, cancel_event=cancel_event)
                     after_mb = os.path.getsize(out_path) / (1024 * 1024)
                     total_before += before_mb
                     total_after += after_mb
                     ok_count += 1
                     saved_pct = (1 - after_mb / before_mb) * 100 if before_mb else 0
                     log(f"  تم: {before_mb:.0f} MB -> {after_mb:.0f} MB "
-                        f"(توفير {saved_pct:.0f}%)\n")
+                        f"(توفير {saved_pct:.0f}%)")
+
+                    if delete_originals:
+                        try:
+                            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                                os.remove(path)
+                                log("  تم حذف الفيديو الأصلي (خيار الحذف التلقائي مفعّل).\n")
+                            else:
+                                log("  تحذير: لم يُحذف الأصلي لأن الملف الناتج يبدو غير سليم.\n")
+                        except OSError as e:
+                            log(f"  تعذر حذف الفيديو الأصلي: {e}\n")
+                    else:
+                        log("")
+                except CompressionCancelled:
+                    cancelled_flag = True
+                    log("  تم إلغاء الضغط أثناء معالجة هذا الملف.\n")
+                    break
                 except subprocess.CalledProcessError as e:
                     log(f"  خطأ أثناء تشغيل ffmpeg على هذا الملف، تم تخطّيه:\n  {e.stderr or e}\n")
                 except Exception as e:
                     log(f"  خطأ على هذا الملف، تم تخطّيه: {e}\n")
 
-            status.set("انتهت الدفعة")
-            if ok_count:
+                duration_done += file_duration
+
+            progress_var.set(0)
+            eta_var.set("")
+            if cancelled_flag:
+                status.set("تم إلغاء الدفعة")
+                log("=== تم إلغاء الدفعة بواسطة المستخدم ===\n")
+            elif ok_count:
+                status.set("انتهت الدفعة")
                 saved_pct_total = (1 - total_after / total_before) * 100 if total_before else 0
                 summary = (f"تمت معالجة {ok_count} من {len(batch)} فيديو.\n"
                            f"الحجم الإجمالي قبل: {total_before/1024:.2f} جيجا\n"
@@ -1063,18 +1445,30 @@ def run_gui():
                 log(summary)
                 messagebox.showinfo("انتهت الدفعة", summary)
             else:
+                status.set("جاهز")
                 messagebox.showerror("فشل", "لم تنجح معالجة أي ملف. راجع السجل للتفاصيل.")
+
             estimate_btn["state"] = "normal"
             start_btn["state"] = "normal"
+            stop_btn["state"] = "disabled"
 
         threading.Thread(target=worker, daemon=True).start()
+
+    progress_row = tk.Frame(root); progress_row.pack(fill="x", padx=12, pady=(6, 0))
+    progress_bar = ttk.Progressbar(progress_row, orient="horizontal", mode="determinate",
+                                    maximum=100, variable=progress_var)
+    progress_bar.pack(fill="x")
+    tk.Label(root, textvariable=eta_var, anchor="w", fg="#777").pack(fill="x", padx=12)
 
     action_row = tk.Frame(root); action_row.pack(fill="x", padx=12, pady=10)
     estimate_btn = tk.Button(action_row, text="تقدير سريع (حجم وجودة قبل الضغط)", command=estimate,
                               bg="#555", fg="white", height=2)
     estimate_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
     start_btn = tk.Button(action_row, text="ابدأ ضغط الكل", command=start, bg="#2d6cdf", fg="white", height=2)
-    start_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
+    start_btn.pack(side="left", fill="x", expand=True, padx=(6, 6))
+    stop_btn = tk.Button(action_row, text="إيقاف", command=request_cancel, bg="#b00020", fg="white",
+                          height=2, state="disabled")
+    stop_btn.pack(side="left", fill="x", padx=(6, 0))
 
     log_box.pack(padx=12, pady=6)
     tk.Label(root, textvariable=status, anchor="w", fg="#555").pack(fill="x", padx=12)
@@ -1084,6 +1478,59 @@ def run_gui():
     populate_encoders()
     refresh_mode()
     refresh_output_mode()
+
+    # --- تحميل آخر إعدادات محفوظة (لو موجودة) --------------------------------
+    saved = load_saved_settings()
+    if saved:
+        try:
+            if saved.get("mode") in ("quality", "size", "smart_percent"):
+                mode_var.set(saved["mode"])
+            if saved.get("quality_level_label") in QUALITY_LEVEL_LABELS.values():
+                quality_level_var.set(saved["quality_level_label"])
+            if "manual_override" in saved:
+                manual_override_var.set(saved["manual_override"])
+            if "target_mb" in saved:
+                target_mb_var.set(str(saved["target_mb"]))
+            if "smart_percent" in saved:
+                smart_percent_var.set(str(saved["smart_percent"]))
+            if saved.get("denoise_label") in DENOISE_LEVEL_LABELS.values():
+                denoise_var.set(saved["denoise_label"])
+            saved_encoder_key = saved.get("encoder_key")
+            if saved_encoder_key:
+                for lbl, k in label_to_key.items():
+                    if k == saved_encoder_key:
+                        encoder_choice.set(lbl)
+                        break
+            if saved.get("output_mode") in ("same", "custom"):
+                output_mode_var.set(saved["output_mode"])
+            if "output_dir" in saved:
+                output_dir_var.set(saved["output_dir"])
+            if "copy_audio" in saved:
+                copy_audio_var.set(bool(saved["copy_audio"]))
+            refresh_mode()
+            refresh_output_mode()
+        except Exception:
+            pass  # إعدادات محفوظة فاسدة أو قديمة - نتجاهلها ونكمل بالقيم الافتراضية
+
+    def on_close():
+        try:
+            save_settings_to_disk({
+                "mode": mode_var.get(),
+                "quality_level_label": quality_level_var.get(),
+                "manual_override": manual_override_var.get(),
+                "target_mb": target_mb_var.get(),
+                "smart_percent": smart_percent_var.get(),
+                "denoise_label": denoise_var.get(),
+                "encoder_key": label_to_key.get(encoder_choice.get()),
+                "output_mode": output_mode_var.get(),
+                "output_dir": output_dir_var.get(),
+                "copy_audio": copy_audio_var.get(),
+            })
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 

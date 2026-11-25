@@ -19,6 +19,17 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
+      - name: Install optional drag-and-drop support (tkinterdnd2)
+        shell: pwsh
+        run: |
+          pip install tkinterdnd2
+          if ($LASTEXITCODE -eq 0) {
+            echo "HAS_DND=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "tkinterdnd2 install failed - building without drag-and-drop support (app still works fine, just without that one feature)."
+            echo "HAS_DND=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
       - name: Download FFmpeg (ffmpeg.exe + ffprobe.exe)
         shell: pwsh
         run: |
@@ -30,11 +41,18 @@ jobs:
           Copy-Item $ffprobeExe.FullName -Destination .
 
       - name: Build single-file EXE (bundles ffmpeg + ffprobe inside)
-        run: >
-          pyinstaller --onefile --windowed --name compress_video
-          --add-binary "ffmpeg.exe;."
-          --add-binary "ffprobe.exe;."
-          compress_video.py
+        shell: pwsh
+        run: |
+          $extraArgs = @()
+          if ($env:HAS_DND -eq "1") {
+            $extraArgs += "--collect-all"
+            $extraArgs += "tkinterdnd2"
+          }
+          pyinstaller --onefile --windowed --name compress_video `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            @extraArgs `
+            compress_video.py
 
       - name: Upload built EXE
         uses: actions/upload-artifact@v4
