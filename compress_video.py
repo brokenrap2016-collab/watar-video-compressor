@@ -37,7 +37,7 @@ import sys
 import tempfile
 import threading
 
-AUDIO_KBPS_DEFAULT = 128
+AUDIO_KBPS_DEFAULT = 320  # جودة صوت عالية (320kbps) - ما تنزل الجودة حتى لو صغّرنا الفيديو كثير
 SAFETY_MARGIN = 0.97  # لطريقة "حجم محدد": نهدف لحجم أقل بقليل من المستهدف كهامش أمان
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m4v", ".wmv", ".flv", ".webm"}
