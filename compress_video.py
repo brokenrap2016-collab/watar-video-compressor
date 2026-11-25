@@ -289,6 +289,67 @@ def run_checked(cmd, log):
                                              output=proc.stdout, stderr=proc.stderr)
 
 
+# ---------------------------------------------------------------------------
+# طريقة "تصغير بنسبة ثابتة لكل فيديو (ذكي)" - الهدف: أي فيديو يدخل البرنامج
+# ينزل حجمه بنسبة محددة (مثلاً 80%) بالنسبة لحجمه هو، لكن بأولوية مطلقة
+# للجودة العالية:
+#   ١. نختبر على عيّنة قصيرة كم نسبة تصغير بتعطي "جودة عالية تلقائياً"
+#      (CRF/CQ) - هذا دائماً أفضل خيار للجودة لأنه ما يفرض بترتيت معيّن.
+#   ٢. لو هذه النسبة وحدها كافية أو أكثر من المطلوب -> نكتفي بها (أعلى جودة
+#      ممكنة، وبدون أي تضييق إضافي غير ضروري على الحجم).
+#   ٣. لو غير كافية (محتوى صعب الضغط) -> نحول لوضع "حجم مستهدف" بحجم يساوي
+#      النسبة المطلوبة من الحجم الأصلي، لكن بدون النزول عن الحد الأدنى
+#      المعقول لعدد البتات (حسب الدقة) حتى لو هذا يعني عدم الوصول للنسبة
+#      كاملة - نفضّل جودة مقبولة دائماً على رقم نسبة دقيق.
+# ---------------------------------------------------------------------------
+
+def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, log,
+                               quality_level="balanced", manual_value=None,
+                               audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off"):
+    before_mb = os.path.getsize(path) / (1024 * 1024)
+    duration = get_duration_seconds(path)
+
+    log(f"  (تصغير ذكي) اختبار عيّنة بجودة عالية تلقائياً أولاً لمعرفة هل تكفي "
+        f"لتحقيق تصغير {percent_reduction:.0f}%...")
+    est = estimate_one(path, "quality", encoder_key, log, quality_level=quality_level,
+                        manual_value=manual_value, denoise_level=denoise_level, sample_len=6.0)
+
+    predicted_pct = None
+    if est and est["estimated_mb"] and before_mb:
+        predicted_pct = (1 - est["estimated_mb"] / before_mb) * 100
+
+    if predicted_pct is not None and predicted_pct >= percent_reduction:
+        log(f"  الجودة العالية التلقائية وحدها كافية (تصغير متوقع ~{predicted_pct:.0f}% "
+            f">= {percent_reduction:.0f}% المطلوب) - سيُستخدم وضع الجودة مباشرة بدون أي "
+            f"تضييق إضافي على الحجم.")
+        compress_quality(path, out_path, encoder_key, quality_level, manual_value, log,
+                          audio_kbps, denoise_level)
+        return
+
+    if predicted_pct is not None:
+        log(f"  الجودة العالية التلقائية وحدها تعطي ~{predicted_pct:.0f}% فقط (أقل من "
+            f"{percent_reduction:.0f}% المطلوب) - سنضيّق الحجم أكثر، بحذر على الجودة.")
+    else:
+        log("  تعذّر اختبار العيّنة، سنكمل مباشرة بوضع الحجم المستهدف.")
+
+    target_mb = before_mb * (1 - percent_reduction / 100.0)
+    four_k = is_4k_or_above(path)
+    floor = quality_floor_kbps(four_k)
+    needed_kbps = compute_video_kbps(target_mb, duration, audio_kbps) if duration > 0 else floor
+
+    if needed_kbps < floor:
+        # النسبة المطلوبة تحتاج بترتيت أقل من الحد الأدنى المعقول لهذه الدقة.
+        # نكتفي بأكبر تصغير ممكن عند الحد الأدنى بالضبط، بدل عيوب ضغط واضحة.
+        safe_target_mb = (floor + audio_kbps) * duration / (8000 * SAFETY_MARGIN) if duration > 0 else target_mb
+        achieved_pct = (1 - safe_target_mb / before_mb) * 100 if before_mb else percent_reduction
+        log(f"  تحذير: تصغير {percent_reduction:.0f}% كامل لهذا الفيديو كان سيعطي عيوب "
+            f"ضغط واضحة بهذه الدقة. سيتم الاكتفاء بأكبر تصغير ممكن مع جودة مقبولة "
+            f"(~{achieved_pct:.0f}% تقريباً) بدل الوصول للنسبة المطلوبة كاملة.")
+        target_mb = safe_target_mb
+
+    compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level)
+
+
 def unique_output_path(out_path):
     """لو في ملف بنفس الاسم أصلاً (ممكن لما نجمع فيديوهات من مجلدات مختلفة
     بنفس الاسم بمجلد حفظ واحد)، نضيف رقم بدل ما نكتب فوق ملف موجود."""
@@ -303,7 +364,7 @@ def unique_output_path(out_path):
 
 def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=None,
                   manual_value=None, audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
-                  output_dir=None):
+                  output_dir=None, smart_percent=None):
     """ينفذ الضغط لملف واحد حسب الطريقة المختارة، ويرجع مسار الملف الناتج.
     لو output_dir محدد يُحفظ الناتج هناك، وإلا بجانب الفيديو الأصلي (كالسابق)."""
     if output_dir:
@@ -316,6 +377,10 @@ def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
                           denoise_level)
     elif mode == "size":
         compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level)
+    elif mode == "smart_percent":
+        compress_smart_percentage(path, out_path, smart_percent, encoder_key, log,
+                                   quality_level=quality_level, manual_value=manual_value,
+                                   audio_kbps=audio_kbps, denoise_level=denoise_level)
     else:
         raise ValueError(f"طريقة غير معروفة: {mode}")
     return out_path
@@ -635,6 +700,8 @@ def run_gui():
     mode_row = tk.Frame(root); mode_row.pack(fill="x", padx=12)
     tk.Radiobutton(mode_row, text="جودة عالية تلقائياً (موصى به - أصغر حجم ممكن بنفس الجودة)",
                     variable=mode_var, value="quality", command=lambda: refresh_mode()).pack(anchor="w")
+    tk.Radiobutton(mode_row, text="تصغير بنسبة ثابتة لكل فيديو (ذكي - جودة أولاً، ثم أقرب نسبة ممكنة بدون التضحية بالجودة)",
+                    variable=mode_var, value="smart_percent", command=lambda: refresh_mode()).pack(anchor="w")
     tk.Radiobutton(mode_row, text="حجم ملف محدد (لو لازم تلتزم بحد أقصى صارم)",
                     variable=mode_var, value="size", command=lambda: refresh_mode()).pack(anchor="w")
 
@@ -647,17 +714,33 @@ def run_gui():
              anchor="w").pack(anchor="w", pady=(6, 0))
     tk.Entry(quality_frame, textvariable=manual_override_var, width=10).pack(anchor="w")
 
+    smart_percent_var = tk.StringVar(value="80")
+    smart_frame = tk.Frame(root)
+    tk.Label(smart_frame,
+             text="نسبة التصغير المطلوبة لكل فيديو (% من حجمه الأصلي هو، مثلاً 80 يعني يصير الحجم خُمس الأصلي تقريباً):",
+             anchor="w", justify="right").pack(anchor="w")
+    tk.Entry(smart_frame, textvariable=smart_percent_var, width=10).pack(anchor="w", pady=2)
+    tk.Label(smart_frame,
+             text="(يُجرَّب وضع الجودة العالية أولاً على كل فيديو؛ لو ما وصل للنسبة المطلوبة يُضغط أكثر، لكن بدون\n"
+                  "النزول عن حد أدنى معقول للجودة حتى لو هذا يعني عدم الوصول للنسبة كاملة لفيديو صعب الضغط)",
+             anchor="w", justify="right", fg="#777").pack(anchor="w")
+
     size_frame = tk.Frame(root)
     tk.Label(size_frame, text="الحجم المطلوب بعد الضغط (ميجابايت، مثلاً 4000 ≈ 4 جيجا):",
              anchor="w").pack(anchor="w")
     tk.Entry(size_frame, textvariable=target_mb_var, width=14).pack(anchor="w", pady=2)
 
     def refresh_mode():
-        if mode_var.get() == "quality":
-            size_frame.pack_forget()
+        quality_frame.pack_forget()
+        smart_frame.pack_forget()
+        size_frame.pack_forget()
+        m = mode_var.get()
+        if m == "quality":
             quality_frame.pack(fill="x", padx=12, pady=2)
+        elif m == "smart_percent":
+            quality_frame.pack(fill="x", padx=12, pady=2)
+            smart_frame.pack(fill="x", padx=12, pady=2)
         else:
-            quality_frame.pack_forget()
             size_frame.pack(fill="x", padx=12, pady=2)
 
     # --- المرمّز -------------------------------------------------------------
@@ -766,6 +849,16 @@ def run_gui():
                 messagebox.showwarning("تنبيه", "اكتب حجماً مستهدفاً صحيحاً بالميجابايت.")
                 return None
 
+        smart_percent = None
+        if mode == "smart_percent":
+            try:
+                smart_percent = float(smart_percent_var.get())
+                if not (0 < smart_percent < 100):
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("تنبيه", "اكتب نسبة تصغير صحيحة بين 1 و99.")
+                return None
+
         denoise_label_to_key = {v: k for k, v in DENOISE_LEVEL_LABELS.items()}
         denoise_level = denoise_label_to_key.get(denoise_var.get(), "off")
 
@@ -779,6 +872,7 @@ def run_gui():
         return {
             "key": key, "mode": mode, "level": level, "manual_value": manual_value,
             "target_mb": target_mb, "denoise_level": denoise_level, "output_dir": output_dir,
+            "smart_percent": smart_percent,
         }
 
     def show_preview_window(path, res):
@@ -874,7 +968,10 @@ def run_gui():
                 log(f"[{idx}/{len(batch)}] {name}")
                 try:
                     before_mb = os.path.getsize(path) / (1024 * 1024)
-                    res = estimate_one(path, settings["mode"], settings["key"], log,
+                    # بوضع "تصغير بنسبة ثابتة (ذكي)"، التقدير السريع يختبر خطوته الأولى
+                    # (جودة عالية تلقائياً) تماماً كما يفعل الضغط الفعلي.
+                    est_mode = "quality" if settings["mode"] == "smart_percent" else settings["mode"]
+                    res = estimate_one(path, est_mode, settings["key"], log,
                                         target_mb=settings["target_mb"], quality_level=settings["level"],
                                         manual_value=settings["manual_value"],
                                         denoise_level=settings["denoise_level"])
@@ -885,7 +982,16 @@ def run_gui():
                     saved_pct = (1 - est_mb / before_mb) * 100 if before_mb else 0
                     log(f"  الحجم الحالي: {before_mb:.0f} MB  →  الحجم المتوقع بعد الضغط: "
                         f"~{est_mb:.0f} MB (توفير تقريبي {saved_pct:.0f}%)")
-                    log(f"  الجودة المتوقعة: {res['verdict']}\n")
+                    log(f"  الجودة المتوقعة: {res['verdict']}")
+                    if settings["mode"] == "smart_percent":
+                        target_pct = settings["smart_percent"]
+                        if saved_pct >= target_pct:
+                            log(f"  => كافٍ لتحقيق هدف {target_pct:.0f}% بجودة عالية تلقائياً بدون أي تنازل.\n")
+                        else:
+                            log(f"  => غير كافٍ لهدف {target_pct:.0f}%، سيضيّق البرنامج الحجم أكثر عند الضغط "
+                                f"الفعلي (بدون النزول عن حد أدنى معقول للجودة).\n")
+                    else:
+                        log("")
                 except Exception as e:
                     log(f"  خطأ أثناء التقدير على هذا الملف: {e}\n")
             status.set("انتهى التقدير")
@@ -908,6 +1014,7 @@ def run_gui():
         target_mb = settings["target_mb"]
         denoise_level = settings["denoise_level"]
         output_dir = settings["output_dir"]
+        smart_percent = settings["smart_percent"]
 
         if output_dir:
             try:
@@ -932,7 +1039,8 @@ def run_gui():
                     before_mb = os.path.getsize(path) / (1024 * 1024)
                     out_path = compress_one(path, mode, key, log, target_mb=target_mb,
                                              quality_level=level, manual_value=manual_value,
-                                             denoise_level=denoise_level, output_dir=output_dir)
+                                             denoise_level=denoise_level, output_dir=output_dir,
+                                             smart_percent=smart_percent)
                     after_mb = os.path.getsize(out_path) / (1024 * 1024)
                     total_before += before_mb
                     total_after += after_mb
