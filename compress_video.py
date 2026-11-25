@@ -286,10 +286,28 @@ def run_checked(cmd, log):
                                              output=proc.stdout, stderr=proc.stderr)
 
 
+def unique_output_path(out_path):
+    """لو في ملف بنفس الاسم أصلاً (ممكن لما نجمع فيديوهات من مجلدات مختلفة
+    بنفس الاسم بمجلد حفظ واحد)، نضيف رقم بدل ما نكتب فوق ملف موجود."""
+    if not os.path.exists(out_path):
+        return out_path
+    base, ext = os.path.splitext(out_path)
+    i = 2
+    while os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
 def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=None,
-                  manual_value=None, audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off"):
-    """ينفذ الضغط لملف واحد حسب الطريقة المختارة، ويرجع مسار الملف الناتج."""
-    out_path = os.path.splitext(path)[0] + "_compressed.mp4"
+                  manual_value=None, audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
+                  output_dir=None):
+    """ينفذ الضغط لملف واحد حسب الطريقة المختارة، ويرجع مسار الملف الناتج.
+    لو output_dir محدد يُحفظ الناتج هناك، وإلا بجانب الفيديو الأصلي (كالسابق)."""
+    if output_dir:
+        base_name = os.path.splitext(os.path.basename(path))[0] + "_compressed.mp4"
+        out_path = unique_output_path(os.path.join(output_dir, base_name))
+    else:
+        out_path = os.path.splitext(path)[0] + "_compressed.mp4"
     if mode == "quality":
         compress_quality(path, out_path, encoder_key, quality_level, manual_value, log, audio_kbps,
                           denoise_level)
@@ -646,6 +664,35 @@ def run_gui():
                                  values=list(DENOISE_LEVEL_LABELS.values()))
     denoise_menu.pack(anchor="w", padx=12)
 
+    # --- مكان الحفظ ----------------------------------------------------------
+    tk.Label(root, text="٥) مكان حفظ الفيديوهات بعد الضغط:", anchor="w").pack(fill="x", **pad)
+    output_mode_var = tk.StringVar(value="same")
+    output_dir_var = tk.StringVar(value="")
+
+    output_mode_row = tk.Frame(root); output_mode_row.pack(fill="x", padx=12)
+    tk.Radiobutton(output_mode_row, text="نفس مكان الفيديو الأصلي (الافتراضي)",
+                    variable=output_mode_var, value="same",
+                    command=lambda: refresh_output_mode()).pack(anchor="w")
+    tk.Radiobutton(output_mode_row, text="مجلد محدد:",
+                    variable=output_mode_var, value="custom",
+                    command=lambda: refresh_output_mode()).pack(anchor="w")
+
+    output_dir_frame = tk.Frame(root)
+    tk.Entry(output_dir_frame, textvariable=output_dir_var, width=58, state="readonly").pack(side="left", padx=(0, 6))
+
+    def choose_output_dir():
+        folder = filedialog.askdirectory()
+        if folder:
+            output_dir_var.set(folder)
+
+    tk.Button(output_dir_frame, text="اختر مجلد...", command=choose_output_dir).pack(side="left")
+
+    def refresh_output_mode():
+        if output_mode_var.get() == "custom":
+            output_dir_frame.pack(fill="x", padx=12, pady=2)
+        else:
+            output_dir_frame.pack_forget()
+
     # --- السجل والحالة -------------------------------------------------------
     log_box = tk.Text(root, height=13, width=84, state="disabled")
 
@@ -713,9 +760,16 @@ def run_gui():
         denoise_label_to_key = {v: k for k, v in DENOISE_LEVEL_LABELS.items()}
         denoise_level = denoise_label_to_key.get(denoise_var.get(), "off")
 
+        output_dir = None
+        if output_mode_var.get() == "custom":
+            output_dir = output_dir_var.get().strip()
+            if not output_dir:
+                messagebox.showwarning("تنبيه", "اختر مجلد الحفظ أولاً، أو اختر 'نفس مكان الفيديو الأصلي'.")
+                return None
+
         return {
             "key": key, "mode": mode, "level": level, "manual_value": manual_value,
-            "target_mb": target_mb, "denoise_level": denoise_level,
+            "target_mb": target_mb, "denoise_level": denoise_level, "output_dir": output_dir,
         }
 
     def show_preview_window(path, res):
@@ -844,6 +898,14 @@ def run_gui():
         manual_value = settings["manual_value"]
         target_mb = settings["target_mb"]
         denoise_level = settings["denoise_level"]
+        output_dir = settings["output_dir"]
+
+        if output_dir:
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror("خطأ", f"تعذر استخدام مجلد الحفظ هذا: {e}")
+                return
 
         estimate_btn["state"] = "disabled"
         start_btn["state"] = "disabled"
@@ -861,7 +923,7 @@ def run_gui():
                     before_mb = os.path.getsize(path) / (1024 * 1024)
                     out_path = compress_one(path, mode, key, log, target_mb=target_mb,
                                              quality_level=level, manual_value=manual_value,
-                                             denoise_level=denoise_level)
+                                             denoise_level=denoise_level, output_dir=output_dir)
                     after_mb = os.path.getsize(out_path) / (1024 * 1024)
                     total_before += before_mb
                     total_after += after_mb
@@ -904,6 +966,7 @@ def run_gui():
 
     populate_encoders()
     refresh_mode()
+    refresh_output_mode()
     root.mainloop()
 
 
