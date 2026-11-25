@@ -194,7 +194,7 @@ def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=No
     bufsize = f"{int(video_kbps * 2)}k"
     return [
         FFMPEG, "-y", "-i", path,
-        "-c:v", codec, "-preset", "p6", "-rc", "vbr",
+        "-c:v", codec, "-preset", "p7", "-rc", "vbr",
         "-b:v", v_bitrate, "-maxrate", maxrate, "-bufsize", bufsize,
         *_vf_args(vf),
         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -203,17 +203,20 @@ def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=No
 
 
 def build_x26x_2pass_cmds(path, out_path, codec, video_kbps, audio_kbps, vf=None):
+    # preset "slow": نفس مستوى الجودة المستخدم بوضع "جودة عالية تلقائياً"، حتى
+    # نستخرج أعلى جودة ممكنة من نفس عدد البتات المستهدف، بدل الإعداد الافتراضي
+    # "medium" (أسرع لكن أضعف كفاءة ضغط بنفس البتريت).
     v_bitrate = f"{int(video_kbps)}k"
     null_out = null_output()
     if codec == "libx265":
-        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-x265-params", "pass=1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-b:v", v_bitrate,
+        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-x265-params", "pass=2", "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path]
     else:  # libx264
-        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-pass", "1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-b:v", v_bitrate,
+        pass2 = [FFMPEG, "-y", "-i", path, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
                  *_vf_args(vf), "-pass", "2", "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path]
     return pass1, pass2
 
@@ -260,7 +263,7 @@ def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf
     elif encoder_key in ("hevc_nvenc", "av1_nvenc"):
         return [
             FFMPEG, "-y", "-i", path,
-            "-c:v", encoder_key, "-preset", "p6", "-rc", "vbr",
+            "-c:v", encoder_key, "-preset", "p7", "-rc", "vbr",
             "-cq", str(quality_value), "-b:v", "0",
             *_vf_args(vf),
             "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -330,10 +333,12 @@ def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
 # هادئ ومشهد ثاني فيه حركة عنيفة) ممكن الرقم الفعلي يختلف شوي.
 
 def build_x26x_singlepass_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None):
-    """نسخة بتمريرة واحدة (أسرع) تُستخدم فقط لتقدير الحجم على عيّنة صغيرة."""
+    """نسخة بتمريرة واحدة (أسرع) تُستخدم فقط لتقدير الحجم/المعاينة على عيّنة صغيرة.
+    نستخدم نفس preset "slow" المستخدم بالترميز الحقيقي (2-pass) حتى يطابق
+    التقدير والمعاينة ما سينتج فعلياً عند ضغط الفيديو كامل."""
     v_bitrate = f"{int(video_kbps)}k"
     return [
-        FFMPEG, "-y", "-i", path, "-c:v", codec, "-b:v", v_bitrate,
+        FFMPEG, "-y", "-i", path, "-c:v", codec, "-preset", "slow", "-b:v", v_bitrate,
         *_vf_args(vf), "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path,
     ]
 
@@ -536,6 +541,10 @@ def run_gui():
         tk.Label(root, image=header_img).pack(pady=(10, 2))
     except Exception:
         pass  # لو حصلت أي مشكلة بتحميل الشعار، البرنامج يستمر بالعمل عادي بدونه
+
+    tk.Label(root, text="الدقة (الريزليوشن) لا تتغيّر أبداً - تبقى نفس دقة الفيديو الأصلي دائماً "
+                         "(4K يضل 4K)، والبرنامج يركّز فقط على ترميز أذكى يحافظ على الجودة بأقل حجم ممكن.",
+             fg="#2d6cdf", justify="right", wraplength=660).pack(pady=(0, 6))
 
     files = []  # قائمة مسارات الفيديوهات بالدفعة
     label_to_key = {}  # نص قائمة المرمّز -> المفتاح الداخلي
