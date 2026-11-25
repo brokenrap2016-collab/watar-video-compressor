@@ -74,6 +74,28 @@ DENOISE_LEVEL_LABELS = {
     "medium": "متوسط (يصغّر أكثر، راقب فقدان تفاصيل دقيقة جداً)",
 }
 
+# سرعة الضغط: مقايضة بين زمن الانتظار وكفاءة الضغط (الجودة لكل بت الناتج).
+# لمرمّزات كرت الشاشة (NVENC): p1 أسرع - p7 أبطأ. للمرمّزات البرمجية
+# (x264/x265): presets قياسية معروفة. الفرق بالجودة بين "متوازن" و"أبطأ"
+# غير ملحوظ عادةً بالعين المجردة، لكن فرق السرعة بينهما كبير جداً.
+SPEED_PRESETS = {
+    "fast":     {"nvenc": "p2", "x26x": "veryfast"},
+    "balanced": {"nvenc": "p5", "x26x": "medium"},
+    "slow":     {"nvenc": "p7", "x26x": "slow"},
+}
+
+SPEED_LEVEL_LABELS = {
+    "fast": "سريع جداً (أقصى سرعة ممكنة)",
+    "balanced": "متوازن - موصى به (سريع جداً، فرق جودة غير ملحوظ تقريباً)",
+    "slow": "أبطأ بكثير (أعلى كفاءة ضغط نظرياً - زمن أطول بكثير مقابل فرق طفيف جداً)",
+}
+
+SPEED_DEFAULT = "balanced"
+
+
+def speed_presets(speed_key):
+    return SPEED_PRESETS.get(speed_key, SPEED_PRESETS[SPEED_DEFAULT])
+
 # شعار واتار برودكشن - مضمّن داخل الملف نفسه (base64) حتى يبقى البرنامج
 # ملفاً واحداً محمولاً بدون أي صور أو موارد خارجية منفصلة.
 LOGO_HEADER_PNG_B64 = (
@@ -322,14 +344,15 @@ def audio_args(audio_kbps, copy_audio=False):
 
 
 def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None,
-                             map_args=None, sub_args=None, copy_audio=False):
+                             map_args=None, sub_args=None, copy_audio=False, speed=SPEED_DEFAULT):
     v_bitrate = f"{int(video_kbps)}k"
     maxrate = f"{int(video_kbps * 1.5)}k"
     bufsize = f"{int(video_kbps * 2)}k"
+    nvenc_preset = speed_presets(speed)["nvenc"]
     return [
         FFMPEG, "-y", "-i", path,
         *(map_args or []),
-        "-c:v", codec, "-preset", "p7", "-rc", "vbr",
+        "-c:v", codec, "-preset", nvenc_preset, "-rc", "vbr",
         "-b:v", v_bitrate, "-maxrate", maxrate, "-bufsize", bufsize,
         *_vf_args(vf),
         *audio_args(audio_kbps, copy_audio),
@@ -339,31 +362,32 @@ def build_nvenc_bitrate_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=No
 
 
 def build_x26x_2pass_cmds(path, out_path, codec, video_kbps, audio_kbps, vf=None,
-                           map_args=None, sub_args=None, copy_audio=False):
-    # preset "slow": نفس مستوى الجودة المستخدم بوضع "جودة عالية تلقائياً"، حتى
-    # نستخرج أعلى جودة ممكنة من نفس عدد البتات المستهدف، بدل الإعداد الافتراضي
-    # "medium" (أسرع لكن أضعف كفاءة ضغط بنفس البتريت).
+                           map_args=None, sub_args=None, copy_audio=False, speed=SPEED_DEFAULT):
+    # preset قابل للاختيار (راجع SPEED_PRESETS): "slow" يعطي أعلى كفاءة ضغط
+    # لكنه أبطأ بكثير؛ "medium"/"veryfast" أسرع بكثير بفرق جودة طفيف جداً.
     # الممرة الأولى (pass 1) تحليل بترات فقط، فيديو بدون صوت/ترجمة، والناتج يُرمى.
     v_bitrate = f"{int(video_kbps)}k"
     null_out = null_output()
     pass1_map = ["-map", "0:v:0?"]
+    x26x_preset = speed_presets(speed)["x26x"]
     if codec == "libx265":
-        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx265", "-preset", "slow", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx265", "-preset", x26x_preset, "-b:v", v_bitrate,
                  *_vf_args(vf), "-x265-params", "pass=1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx265", "-preset", "slow",
+        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx265", "-preset", x26x_preset,
                  "-b:v", v_bitrate, *_vf_args(vf), "-x265-params", "pass=2",
                  *audio_args(audio_kbps, copy_audio), *(sub_args or []), out_path]
     else:  # libx264
-        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx264", "-preset", "slow", "-b:v", v_bitrate,
+        pass1 = [FFMPEG, "-y", "-i", path, *pass1_map, "-c:v", "libx264", "-preset", x26x_preset, "-b:v", v_bitrate,
                  *_vf_args(vf), "-pass", "1", "-an", "-f", "mp4", null_out]
-        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx264", "-preset", "slow",
+        pass2 = [FFMPEG, "-y", "-i", path, *(map_args or []), "-c:v", "libx264", "-preset", x26x_preset,
                  "-b:v", v_bitrate, *_vf_args(vf), "-pass", "2",
                  *audio_args(audio_kbps, copy_audio), *(sub_args or []), out_path]
     return pass1, pass2
 
 
 def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps=AUDIO_KBPS_DEFAULT,
-                          denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None):
+                          denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None,
+                          speed=SPEED_DEFAULT):
     duration = get_duration_seconds(path)
     four_k = is_4k_or_above(path)
 
@@ -384,12 +408,12 @@ def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps
     if encoder_key in ("av1_nvenc", "hevc_nvenc"):
         log(f"  الترميز بواسطة {encoder_key} (كرت الشاشة) لحجم مستهدف...")
         cmd = build_nvenc_bitrate_cmd(path, out_path, encoder_key, video_kbps, audio_kbps, vf,
-                                       map_args, sub_args, copy_audio)
+                                       map_args, sub_args, copy_audio, speed=speed)
         run_checked(cmd, log, progress_cb=progress_cb, total_duration=duration, cancel_event=cancel_event)
     elif encoder_key in ("libx265", "libx264"):
         log(f"  الترميز بالمعالج ({encoder_key}، مرحلتين) لحجم مستهدف...")
         pass1, pass2 = build_x26x_2pass_cmds(path, out_path, encoder_key, video_kbps, audio_kbps, vf,
-                                              map_args, sub_args, copy_audio)
+                                              map_args, sub_args, copy_audio, speed=speed)
 
         def pass1_cb(frac, _cb=progress_cb):
             if _cb:
@@ -412,12 +436,13 @@ def compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps
 # ---------------------------------------------------------------------------
 
 def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf=None,
-                       map_args=None, sub_args=None, copy_audio=False):
+                       map_args=None, sub_args=None, copy_audio=False, speed=SPEED_DEFAULT):
+    presets = speed_presets(speed)
     if encoder_key in ("libx265", "libx264"):
         return [
             FFMPEG, "-y", "-i", path,
             *(map_args or []),
-            "-c:v", encoder_key, "-preset", "slow", "-crf", str(quality_value),
+            "-c:v", encoder_key, "-preset", presets["x26x"], "-crf", str(quality_value),
             *_vf_args(vf),
             *audio_args(audio_kbps, copy_audio),
             *(sub_args or []),
@@ -427,7 +452,7 @@ def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf
         return [
             FFMPEG, "-y", "-i", path,
             *(map_args or []),
-            "-c:v", encoder_key, "-preset", "p7", "-rc", "vbr",
+            "-c:v", encoder_key, "-preset", presets["nvenc"], "-rc", "vbr",
             "-cq", str(quality_value), "-b:v", "0",
             *_vf_args(vf),
             *audio_args(audio_kbps, copy_audio),
@@ -438,13 +463,15 @@ def build_quality_cmd(path, out_path, encoder_key, quality_value, audio_kbps, vf
 
 
 def compress_quality(path, out_path, encoder_key, level, manual_value, log, audio_kbps=AUDIO_KBPS_DEFAULT,
-                      denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None):
+                      denoise_level="off", copy_audio=False, progress_cb=None, cancel_event=None,
+                      speed=SPEED_DEFAULT):
     value = manual_value if manual_value is not None else QUALITY_PRESETS[encoder_key][level]
     vf = DENOISE_FILTERS.get(denoise_level)
     map_args, sub_args = build_map_args(path, log)
     log(f"  الترميز بواسطة {encoder_key} بجودة ثابتة (قيمة {value})"
         f"{' مع تنعيم ضوضاء' if vf else ''}...")
-    cmd = build_quality_cmd(path, out_path, encoder_key, value, audio_kbps, vf, map_args, sub_args, copy_audio)
+    cmd = build_quality_cmd(path, out_path, encoder_key, value, audio_kbps, vf, map_args, sub_args,
+                             copy_audio, speed=speed)
     duration = get_duration_seconds(path) if progress_cb else None
     run_checked(cmd, log, progress_cb=progress_cb, total_duration=duration, cancel_event=cancel_event)
 
@@ -531,14 +558,16 @@ def run_checked(cmd, log, progress_cb=None, total_duration=None, cancel_event=No
 def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, log,
                                quality_level="balanced", manual_value=None,
                                audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
-                               copy_audio=False, progress_cb=None, cancel_event=None):
+                               copy_audio=False, progress_cb=None, cancel_event=None,
+                               speed=SPEED_DEFAULT):
     before_mb = os.path.getsize(path) / (1024 * 1024)
     duration = get_duration_seconds(path)
 
     log(f"  (تصغير ذكي) اختبار عيّنة بجودة عالية تلقائياً أولاً لمعرفة هل تكفي "
         f"لتحقيق تصغير {percent_reduction:.0f}%...")
     est = estimate_one(path, "quality", encoder_key, log, quality_level=quality_level,
-                        manual_value=manual_value, denoise_level=denoise_level, sample_len=6.0)
+                        manual_value=manual_value, denoise_level=denoise_level, sample_len=6.0,
+                        speed=speed)
 
     predicted_pct = None
     if est and est["estimated_mb"] and before_mb:
@@ -550,7 +579,7 @@ def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, lo
             f"تضييق إضافي على الحجم.")
         compress_quality(path, out_path, encoder_key, quality_level, manual_value, log,
                           audio_kbps, denoise_level, copy_audio=copy_audio,
-                          progress_cb=progress_cb, cancel_event=cancel_event)
+                          progress_cb=progress_cb, cancel_event=cancel_event, speed=speed)
         return
 
     if predicted_pct is not None:
@@ -575,7 +604,8 @@ def compress_smart_percentage(path, out_path, percent_reduction, encoder_key, lo
         target_mb = safe_target_mb
 
     compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level,
-                          copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event)
+                          copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event,
+                          speed=speed)
 
 
 def unique_output_path(out_path):
@@ -593,7 +623,7 @@ def unique_output_path(out_path):
 def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=None,
                   manual_value=None, audio_kbps=AUDIO_KBPS_DEFAULT, denoise_level="off",
                   output_dir=None, smart_percent=None, copy_audio=False,
-                  progress_cb=None, cancel_event=None):
+                  progress_cb=None, cancel_event=None, speed=SPEED_DEFAULT):
     """ينفذ الضغط لملف واحد حسب الطريقة المختارة، ويرجع مسار الملف الناتج.
     لو output_dir محدد يُحفظ الناتج هناك، وإلا بجانب الفيديو الأصلي (كالسابق)."""
     if output_dir:
@@ -604,16 +634,17 @@ def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
     if mode == "quality":
         compress_quality(path, out_path, encoder_key, quality_level, manual_value, log, audio_kbps,
                           denoise_level, copy_audio=copy_audio, progress_cb=progress_cb,
-                          cancel_event=cancel_event)
+                          cancel_event=cancel_event, speed=speed)
     elif mode == "size":
         compress_target_size(path, out_path, target_mb, encoder_key, log, audio_kbps, denoise_level,
-                              copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event)
+                              copy_audio=copy_audio, progress_cb=progress_cb, cancel_event=cancel_event,
+                              speed=speed)
     elif mode == "smart_percent":
         compress_smart_percentage(path, out_path, smart_percent, encoder_key, log,
                                    quality_level=quality_level, manual_value=manual_value,
                                    audio_kbps=audio_kbps, denoise_level=denoise_level,
                                    copy_audio=copy_audio, progress_cb=progress_cb,
-                                   cancel_event=cancel_event)
+                                   cancel_event=cancel_event, speed=speed)
     else:
         raise ValueError(f"طريقة غير معروفة: {mode}")
     return out_path
@@ -630,13 +661,14 @@ def compress_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
 # لكنه يبقى تقديراً: لو باقي الفيديو مختلف كثير عن العيّنات (مثلاً مشهد واحد
 # هادئ ومشهد ثاني فيه حركة عنيفة) ممكن الرقم الفعلي يختلف شوي.
 
-def build_x26x_singlepass_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None):
+def build_x26x_singlepass_cmd(path, out_path, codec, video_kbps, audio_kbps, vf=None, speed=SPEED_DEFAULT):
     """نسخة بتمريرة واحدة (أسرع) تُستخدم فقط لتقدير الحجم/المعاينة على عيّنة صغيرة.
-    نستخدم نفس preset "slow" المستخدم بالترميز الحقيقي (2-pass) حتى يطابق
-    التقدير والمعاينة ما سينتج فعلياً عند ضغط الفيديو كامل."""
+    نستخدم نفس preset المستخدم بالترميز الحقيقي حتى يطابق التقدير والمعاينة
+    ما سينتج فعلياً عند ضغط الفيديو كامل."""
     v_bitrate = f"{int(video_kbps)}k"
+    x26x_preset = speed_presets(speed)["x26x"]
     return [
-        FFMPEG, "-y", "-i", path, "-c:v", codec, "-preset", "slow", "-b:v", v_bitrate,
+        FFMPEG, "-y", "-i", path, "-c:v", codec, "-preset", x26x_preset, "-b:v", v_bitrate,
         *_vf_args(vf), "-c:a", "aac", "-b:a", f"{audio_kbps}k", out_path,
     ]
 
@@ -679,7 +711,7 @@ def pick_sample_starts(duration, sample_len=6.0):
 
 def estimate_one(path, mode, encoder_key, log, target_mb=None, quality_level=None,
                   manual_value=None, denoise_level="off", audio_kbps=AUDIO_KBPS_DEFAULT,
-                  sample_len=6.0):
+                  sample_len=6.0, speed=SPEED_DEFAULT):
     """يرجع dict فيه الحجم التقديري ومستوى الجودة المتوقع، أو None لو فشل."""
     duration = get_duration_seconds(path)
     vf = DENOISE_FILTERS.get(denoise_level)
@@ -707,11 +739,11 @@ def estimate_one(path, mode, encoder_key, log, target_mb=None, quality_level=Non
                 continue
 
             if mode == "quality":
-                cmd = build_quality_cmd(raw, enc, encoder_key, quality_value, audio_kbps, vf)
+                cmd = build_quality_cmd(raw, enc, encoder_key, quality_value, audio_kbps, vf, speed=speed)
             elif encoder_key in ("av1_nvenc", "hevc_nvenc"):
-                cmd = build_nvenc_bitrate_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+                cmd = build_nvenc_bitrate_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf, speed=speed)
             else:
-                cmd = build_x26x_singlepass_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+                cmd = build_x26x_singlepass_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf, speed=speed)
             run_checked(cmd, log)
 
             enc_size = os.path.getsize(enc)
@@ -750,7 +782,7 @@ def extract_frame_png(path, timestamp_seconds, out_path, log, width=640):
 
 def preview_quality(path, mode, encoder_key, log, target_mb=None, quality_level=None,
                      manual_value=None, denoise_level="off", audio_kbps=AUDIO_KBPS_DEFAULT,
-                     sample_len=3.0, frame_width=640):
+                     sample_len=3.0, frame_width=640, speed=SPEED_DEFAULT):
     """
     معاينة سريعة لجودة الضغط على فيديو واحد: يسحب عيّنة قصيرة من منتصف الفيديو
     تقريباً، يضغطها بنفس الإعدادات المطلوبة، ثم يطلع صورتين (قبل/بعد) لنفس
@@ -783,12 +815,12 @@ def preview_quality(path, mode, encoder_key, log, target_mb=None, quality_level=
         if mode == "size":
             target_video_kbps = max(compute_video_kbps(target_mb, duration, audio_kbps), 150)
             if encoder_key in ("av1_nvenc", "hevc_nvenc"):
-                cmd = build_nvenc_bitrate_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+                cmd = build_nvenc_bitrate_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf, speed=speed)
             else:
-                cmd = build_x26x_singlepass_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf)
+                cmd = build_x26x_singlepass_cmd(raw, enc, encoder_key, target_video_kbps, audio_kbps, vf, speed=speed)
         else:
             quality_value = manual_value if manual_value is not None else QUALITY_PRESETS[encoder_key][quality_level]
-            cmd = build_quality_cmd(raw, enc, encoder_key, quality_value, audio_kbps, vf)
+            cmd = build_quality_cmd(raw, enc, encoder_key, quality_value, audio_kbps, vf, speed=speed)
         run_checked(cmd, log)
 
         frame_t = max(0.0, min(actual_dur / 2.0, actual_dur - 0.05))
@@ -866,6 +898,7 @@ def run_gui():
     target_mb_var = tk.StringVar(value="4000")
     encoder_choice = tk.StringVar()
     denoise_var = tk.StringVar(value=DENOISE_LEVEL_LABELS["off"])
+    speed_var = tk.StringVar(value=SPEED_LEVEL_LABELS[SPEED_DEFAULT])
     copy_audio_var = tk.BooleanVar(value=False)
     delete_originals_var = tk.BooleanVar(value=False)
     status = tk.StringVar(value="جاهز")
@@ -1047,8 +1080,16 @@ def run_gui():
     encoder_menu = ttk.Combobox(root, textvariable=encoder_choice, state="readonly", width=63)
     encoder_menu.pack(anchor="w", padx=12)
 
+    # --- سرعة الضغط ----------------------------------------------------------
+    tk.Label(root, text="٤) سرعة الضغط (الإعداد الافتراضي \"متوازن\" سريع جداً مع فرق جودة لا يكاد\n"
+                         "يُلاحظ؛ اختر \"أبطأ بكثير\" فقط لو عندك وقت ومحتاج أعلى كفاءة ضغط نظرياً):",
+             anchor="w", justify="right").pack(fill="x", **pad)
+    speed_menu = ttk.Combobox(root, textvariable=speed_var, state="readonly", width=63,
+                               values=list(SPEED_LEVEL_LABELS.values()))
+    speed_menu.pack(anchor="w", padx=12)
+
     # --- تنعيم الضوضاء -------------------------------------------------------
-    tk.Label(root, text="٤) تنعيم ضوضاء الكاميرا قبل الضغط (يصغّر الحجم إضافياً للفيديوهات فيها حبيبات/تشويش -\n"
+    tk.Label(root, text="٥) تنعيم ضوضاء الكاميرا قبل الضغط (يصغّر الحجم إضافياً للفيديوهات فيها حبيبات/تشويش -\n"
                          "جرّبها وقارن؛ لفيديوهات نظيفة أصلاً مثل تصوير الشاشة ما تفيد كثير):",
              anchor="w", justify="right").pack(fill="x", **pad)
     denoise_menu = ttk.Combobox(root, textvariable=denoise_var, state="readonly", width=63,
@@ -1061,7 +1102,7 @@ def run_gui():
                    wraplength=660).pack(fill="x", padx=12, pady=(2, 0))
 
     # --- مكان الحفظ ----------------------------------------------------------
-    tk.Label(root, text="٥) مكان حفظ الفيديوهات بعد الضغط:", anchor="w").pack(fill="x", **pad)
+    tk.Label(root, text="٦) مكان حفظ الفيديوهات بعد الضغط:", anchor="w").pack(fill="x", **pad)
     output_mode_var = tk.StringVar(value="same")
     output_dir_var = tk.StringVar(value="")
 
@@ -1176,11 +1217,14 @@ def run_gui():
                 messagebox.showwarning("تنبيه", "اختر مجلد الحفظ أولاً، أو اختر 'نفس مكان الفيديو الأصلي'.")
                 return None
 
+        speed_label_to_key = {v: k for k, v in SPEED_LEVEL_LABELS.items()}
+        speed = speed_label_to_key.get(speed_var.get(), SPEED_DEFAULT)
+
         return {
             "key": key, "mode": mode, "level": level, "manual_value": manual_value,
             "target_mb": target_mb, "denoise_level": denoise_level, "output_dir": output_dir,
             "smart_percent": smart_percent, "copy_audio": copy_audio_var.get(),
-            "delete_originals": delete_originals_var.get(),
+            "delete_originals": delete_originals_var.get(), "speed": speed,
         }
 
     def show_preview_window(path, res):
@@ -1242,6 +1286,8 @@ def run_gui():
             return
         denoise_label_to_key = {v: k for k, v in DENOISE_LEVEL_LABELS.items()}
         denoise_level = denoise_label_to_key.get(denoise_var.get(), "off")
+        speed_label_to_key = {v: k for k, v in SPEED_LEVEL_LABELS.items()}
+        speed = speed_label_to_key.get(speed_var.get(), SPEED_DEFAULT)
 
         preview_btn["state"] = "disabled"
         status.set("جاري تجهيز المعاينة...")
@@ -1249,7 +1295,7 @@ def run_gui():
         def worker():
             try:
                 res = preview_quality(path, "size", key, log, target_mb=target_mb,
-                                       denoise_level=denoise_level)
+                                       denoise_level=denoise_level, speed=speed)
                 root.after(0, lambda: show_preview_window(path, res))
             except Exception as e:
                 err = str(e)
@@ -1282,7 +1328,7 @@ def run_gui():
                     res = estimate_one(path, est_mode, settings["key"], log,
                                         target_mb=settings["target_mb"], quality_level=settings["level"],
                                         manual_value=settings["manual_value"],
-                                        denoise_level=settings["denoise_level"])
+                                        denoise_level=settings["denoise_level"], speed=settings["speed"])
                     if res is None:
                         log("  تعذر عمل تقدير لهذا الملف (تخطّيته).\n")
                         continue
@@ -1330,6 +1376,7 @@ def run_gui():
         smart_percent = settings["smart_percent"]
         copy_audio = settings["copy_audio"]
         delete_originals = settings["delete_originals"]
+        speed = settings["speed"]
 
         if output_dir:
             try:
@@ -1399,7 +1446,8 @@ def run_gui():
                                              quality_level=level, manual_value=manual_value,
                                              denoise_level=denoise_level, output_dir=output_dir,
                                              smart_percent=smart_percent, copy_audio=copy_audio,
-                                             progress_cb=file_progress_cb, cancel_event=cancel_event)
+                                             progress_cb=file_progress_cb, cancel_event=cancel_event,
+                                             speed=speed)
                     after_mb = os.path.getsize(out_path) / (1024 * 1024)
                     total_before += before_mb
                     total_after += after_mb
@@ -1495,6 +1543,8 @@ def run_gui():
                 smart_percent_var.set(str(saved["smart_percent"]))
             if saved.get("denoise_label") in DENOISE_LEVEL_LABELS.values():
                 denoise_var.set(saved["denoise_label"])
+            if saved.get("speed_label") in SPEED_LEVEL_LABELS.values():
+                speed_var.set(saved["speed_label"])
             saved_encoder_key = saved.get("encoder_key")
             if saved_encoder_key:
                 for lbl, k in label_to_key.items():
@@ -1521,6 +1571,7 @@ def run_gui():
                 "target_mb": target_mb_var.get(),
                 "smart_percent": smart_percent_var.get(),
                 "denoise_label": denoise_var.get(),
+                "speed_label": speed_var.get(),
                 "encoder_key": label_to_key.get(encoder_choice.get()),
                 "output_mode": output_mode_var.get(),
                 "output_dir": output_dir_var.get(),
