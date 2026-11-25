@@ -931,18 +931,40 @@ def run_gui():
         return output_dir_var.get().strip() if output_mode_var.get() == "custom" else None
 
     def add_paths(paths):
-        """يضيف قائمة مسارات (ملفات أو مجلدات) للدفعة، مع تخطّي أي فيديو له
-        ناتج مضغوط موجود مسبقاً بمكان الحفظ الحالي. يرجع (عدد المُضاف, عدد المتخطّى)."""
+        """يضيف قائمة مسارات (ملفات أو مجلدات) للدفعة. لو فيه فيديوهات إلها ناتج
+        مضغوط موجود مسبقاً بمكان الحفظ الحالي، يسأل المستخدم مرة وحدة هل يضيفهم
+        ويعيد ضغطهم من جديد (مثلاً لتجربة طريقة/إعداد مختلف) أو يتخطاهم، بدل ما
+        يتخطاهم بصمت دايماً - هيك تقدر تعيد ضغط نفس الفيديو أكثر من مرة لما تحب.
+        يرجع (عدد المُضاف, عدد المتخطّى)."""
         out_dir = current_output_dir_for_skip_check()
-        added, skipped = 0, 0
+        already_done = []
+        fresh = []
         for p in paths:
             if p in files:
                 continue
             if has_compressed_output(p, out_dir):
-                skipped += 1
-                continue
+                already_done.append(p)
+            else:
+                fresh.append(p)
+
+        for p in fresh:
             files.append(p)
-            added += 1
+        added = len(fresh)
+        skipped = 0
+
+        if already_done:
+            recompress_too = messagebox.askyesno(
+                "فيديوهات مضغوطة مسبقاً",
+                f"فيه {len(already_done)} فيديو إله ناتج مضغوط موجود مسبقاً بمكان الحفظ الحالي.\n\n"
+                f"بدك تضيفهم وتعيد ضغطهم من جديد (مثلاً عشان تجرب طريقة أو إعداد مختلف)؟\n"
+                f"اختر 'لا' للتخطي والاكتفاء بالباقي بس.")
+            if recompress_too:
+                for p in already_done:
+                    files.append(p)
+                added += len(already_done)
+            else:
+                skipped = len(already_done)
+
         refresh_listbox()
         return added, skipped
 
@@ -954,9 +976,9 @@ def run_gui():
             return
         added, skipped = add_paths(paths)
         if skipped:
-            messagebox.showinfo("تخطّي ملفات مضغوطة مسبقاً",
+            messagebox.showinfo("تم التخطي",
                                  f"تمت إضافة {added} فيديو، وتخطّي {skipped} فيديو له ناتج "
-                                 f"مضغوط موجود مسبقاً تلقائياً.")
+                                 f"مضغوط موجود مسبقاً (باختيارك).")
 
     def add_folder():
         folder = filedialog.askdirectory()
@@ -969,7 +991,7 @@ def run_gui():
         added, skipped = add_paths(found)
         msg = f"تمت إضافة {added} فيديو."
         if skipped:
-            msg += f"\nتم تخطّي {skipped} فيديو له ناتج مضغوط موجود مسبقاً تلقائياً."
+            msg += f"\nتم تخطّي {skipped} فيديو له ناتج مضغوط موجود مسبقاً (باختيارك)."
         messagebox.showinfo("تمت الإضافة", msg)
 
     def remove_selected():
